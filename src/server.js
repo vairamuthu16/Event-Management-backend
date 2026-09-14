@@ -1,7 +1,3 @@
-import dns from 'node:dns';
-
-dns.setDefaultResultOrder('ipv4first');
-
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -19,91 +15,101 @@ import supportRoutes from './routes/support.js';
 
 const app = express();
 
-const port = process.env.PORT || 5000;
+/* =========================================
+   BASIC CONFIG
+========================================= */
 
-/* =========================
-   STARTUP INFORMATION
-========================= */
-
-console.log('========================================');
-console.log('Starting EventHub API');
-console.log('PORT:', port);
-console.log('MONGO_URI exists:', Boolean(process.env.MONGO_URI));
-console.log('JWT_SECRET exists:', Boolean(process.env.JWT_SECRET));
-console.log('CLIENT_URL:', process.env.CLIENT_URL || 'undefined');
-console.log('========================================');
-
-/* =========================
-   CORS
-========================= */
+const PORT = Number(process.env.PORT) || 10000;
 
 const allowedOrigins = [
   'http://localhost:5173',
   'http://localhost:5174',
-  'https://event-management-system-vairam.netlify.app'
+  'https://event-management-system-vairam.netlify.app',
+
+  ...(process.env.CLIENT_URL
+    ? process.env.CLIENT_URL
+        .split(',')
+        .map((url) => url.trim())
+        .filter(Boolean)
+    : [])
 ];
 
-if (process.env.CLIENT_URL) {
-  const extraOrigins = process.env.CLIENT_URL
-    .split(',')
-    .map((url) => url.trim())
-    .filter(Boolean);
+console.log('========================================');
+console.log('Starting EventHub API');
+console.log('PORT:', PORT);
+console.log('MONGO_URI exists:', Boolean(process.env.MONGO_URI));
+console.log('JWT_SECRET exists:', Boolean(process.env.JWT_SECRET));
+console.log('CLIENT_URL:', process.env.CLIENT_URL);
+console.log('Allowed origins:', allowedOrigins);
+console.log('========================================');
 
-  allowedOrigins.push(...extraOrigins);
-}
+/* =========================================
+   CORS
+========================================= */
 
-console.log('Allowed CORS origins:', allowedOrigins);
+app.use(
+  cors({
+    origin: function (origin, callback) {
+      if (!origin) {
+        return callback(null, true);
+      }
 
-const corsOptions = {
-  origin: function (origin, callback) {
-    // Allow requests without an Origin header
-    // such as curl, Postman and server-to-server requests.
-    if (!origin) {
-      return callback(null, true);
-    }
+      if (allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
 
-    if (allowedOrigins.includes(origin)) {
-      return callback(null, true);
-    }
+      console.log('CORS blocked origin:', origin);
 
-    console.log('CORS blocked origin:', origin);
+      return callback(null, false);
+    },
 
-    return callback(
-      new Error(`CORS blocked: ${origin}`)
-    );
-  },
+    credentials: true,
 
-  credentials: true,
+    methods: [
+      'GET',
+      'POST',
+      'PUT',
+      'PATCH',
+      'DELETE',
+      'OPTIONS'
+    ],
 
-  methods: [
-    'GET',
-    'POST',
-    'PUT',
-    'PATCH',
-    'DELETE',
-    'OPTIONS'
-  ],
+    allowedHeaders: [
+      'Content-Type',
+      'Authorization'
+    ]
+  })
+);
 
-  allowedHeaders: [
-    'Content-Type',
-    'Authorization'
-  ],
-
-  optionsSuccessStatus: 204
-};
-
-app.use(cors(corsOptions));
-
-/* =========================
+/* =========================================
    BODY PARSERS
-========================= */
+========================================= */
 
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true }));
 
-/* =========================
+/* =========================================
+   ROOT TEST
+========================================= */
+
+app.get('/', (req, res) => {
+  res.status(200).json({
+    ok: true,
+    service: 'eventhub-api',
+    message: 'EventHub backend is running'
+  });
+});
+
+/* =========================================
    HEALTH CHECK
-========================= */
+========================================= */
+
+app.get('/health', (req, res) => {
+  res.status(200).json({
+    ok: true,
+    service: 'eventhub-api'
+  });
+});
 
 app.get('/api/health', (req, res) => {
   res.status(200).json({
@@ -112,9 +118,9 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-/* =========================
+/* =========================================
    API ROUTES
-========================= */
+========================================= */
 
 app.use('/api/auth', authRoutes);
 
@@ -130,20 +136,22 @@ app.use('/api/analytics', analyticsRoutes);
 
 app.use('/api/support', supportRoutes);
 
-/* =========================
+/* =========================================
    404 HANDLER
-========================= */
+========================================= */
 
 app.use((req, res) => {
+  console.log('404:', req.method, req.originalUrl);
+
   res.status(404).json({
     message: 'API route not found',
     path: req.originalUrl
   });
 });
 
-/* =========================
+/* =========================================
    ERROR HANDLER
-========================= */
+========================================= */
 
 app.use((err, req, res, next) => {
   console.error('Server error:', err);
@@ -153,22 +161,33 @@ app.use((err, req, res, next) => {
   });
 });
 
-/* =========================
-   DATABASE + SERVER
-========================= */
+/* =========================================
+   START SERVER
+========================================= */
 
-console.log('Connecting to MongoDB...');
+async function startServer() {
+  try {
+    console.log('Connecting to MongoDB...');
 
-mongoose
-  .connect(process.env.MONGO_URI)
-  .then(() => {
+    await mongoose.connect(process.env.MONGO_URI);
+
     console.log('MongoDB connected successfully');
 
-    app.listen(port, '0.0.0.0', () => {
-      console.log(`API running on 0.0.0.0:${port}`);
+    // IMPORTANT:
+    // Only ONE app.listen() in the entire file.
+    // Render requires 0.0.0.0:$PORT.
+
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log('========================================');
+      console.log(`API running on 0.0.0.0:${PORT}`);
+      console.log(`Health: http://0.0.0.0:${PORT}/health`);
+      console.log('========================================');
     });
-  })
-  .catch((error) => {
+
+  } catch (error) {
     console.error('MongoDB connection failed:', error);
     process.exit(1);
-  });
+  }
+}
+
+startServer();
