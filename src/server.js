@@ -21,9 +21,21 @@ const app = express();
 
 const port = process.env.PORT || 5000;
 
-/* =====================================================
+/* =========================
+   STARTUP INFORMATION
+========================= */
+
+console.log('========================================');
+console.log('Starting EventHub API');
+console.log('PORT:', port);
+console.log('MONGO_URI exists:', Boolean(process.env.MONGO_URI));
+console.log('JWT_SECRET exists:', Boolean(process.env.JWT_SECRET));
+console.log('CLIENT_URL:', process.env.CLIENT_URL || 'undefined');
+console.log('========================================');
+
+/* =========================
    CORS
-===================================================== */
+========================= */
 
 const allowedOrigins = [
   'http://localhost:5173',
@@ -32,15 +44,12 @@ const allowedOrigins = [
 ];
 
 if (process.env.CLIENT_URL) {
-  process.env.CLIENT_URL
+  const extraOrigins = process.env.CLIENT_URL
     .split(',')
     .map((url) => url.trim())
-    .filter(Boolean)
-    .forEach((url) => {
-      if (!allowedOrigins.includes(url)) {
-        allowedOrigins.push(url);
-      }
-    });
+    .filter(Boolean);
+
+  allowedOrigins.push(...extraOrigins);
 }
 
 console.log('Allowed CORS origins:', allowedOrigins);
@@ -48,7 +57,7 @@ console.log('Allowed CORS origins:', allowedOrigins);
 const corsOptions = {
   origin: function (origin, callback) {
     // Allow requests without an Origin header
-    // such as Postman or server-to-server requests.
+    // such as curl, Postman and server-to-server requests.
     if (!origin) {
       return callback(null, true);
     }
@@ -59,7 +68,9 @@ const corsOptions = {
 
     console.log('CORS blocked origin:', origin);
 
-    return callback(null, false);
+    return callback(
+      new Error(`CORS blocked: ${origin}`)
+    );
   },
 
   credentials: true,
@@ -83,44 +94,45 @@ const corsOptions = {
 
 app.use(cors(corsOptions));
 
-/*
-  Explicitly handle browser preflight requests.
-*/
-app.options(/.*/, cors(corsOptions));
-
-/* =====================================================
+/* =========================
    BODY PARSERS
-===================================================== */
+========================= */
 
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true }));
 
-/* =====================================================
+/* =========================
    HEALTH CHECK
-===================================================== */
+========================= */
 
 app.get('/api/health', (req, res) => {
-  res.json({
+  res.status(200).json({
     ok: true,
     service: 'eventhub-api'
   });
 });
 
-/* =====================================================
+/* =========================
    API ROUTES
-===================================================== */
+========================= */
 
 app.use('/api/auth', authRoutes);
+
 app.use('/api/events', eventRoutes);
+
 app.use('/api/tickets', ticketRoutes);
+
 app.use('/api/users', userRoutes);
+
 app.use('/api/admin', adminRoutes);
+
 app.use('/api/analytics', analyticsRoutes);
+
 app.use('/api/support', supportRoutes);
 
-/* =====================================================
-   404
-===================================================== */
+/* =========================
+   404 HANDLER
+========================= */
 
 app.use((req, res) => {
   res.status(404).json({
@@ -129,9 +141,9 @@ app.use((req, res) => {
   });
 });
 
-/* =====================================================
+/* =========================
    ERROR HANDLER
-===================================================== */
+========================= */
 
 app.use((err, req, res, next) => {
   console.error('Server error:', err);
@@ -141,38 +153,22 @@ app.use((err, req, res, next) => {
   });
 });
 
-/* =====================================================
-   START SERVER
-===================================================== */
-
-console.log('========================================');
-console.log('Starting EventHub API');
-console.log('PORT:', port);
-console.log('MONGO_URI exists:', !!process.env.MONGO_URI);
-console.log('JWT_SECRET exists:', !!process.env.JWT_SECRET);
-console.log('CLIENT_URL:', process.env.CLIENT_URL);
-console.log('========================================');
-
-app.listen(port, () => {
-  console.log(`API running on port ${port}`);
-});
-
-/* =====================================================
-   MONGODB
-===================================================== */
+/* =========================
+   DATABASE + SERVER
+========================= */
 
 console.log('Connecting to MongoDB...');
 
 mongoose
   .connect(process.env.MONGO_URI)
   .then(() => {
-    console.log('MongoDB connected');
+    console.log('MongoDB connected successfully');
 
     app.listen(port, '0.0.0.0', () => {
       console.log(`API running on 0.0.0.0:${port}`);
     });
   })
-  .catch((err) => {
-    console.error('MongoDB connection failed:', err);
+  .catch((error) => {
+    console.error('MongoDB connection failed:', error);
     process.exit(1);
   });
