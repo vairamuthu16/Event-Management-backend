@@ -19,19 +19,7 @@ import supportRoutes from './routes/support.js';
 
 const app = express();
 
-/* =====================================================
-   ENVIRONMENT / STARTUP LOGS
-===================================================== */
-
 const port = process.env.PORT || 5000;
-
-console.log('========================================');
-console.log('Starting EventHub API...');
-console.log('PORT:', port);
-console.log('MONGO_URI exists:', !!process.env.MONGO_URI);
-console.log('JWT_SECRET exists:', !!process.env.JWT_SECRET);
-console.log('CLIENT_URL:', process.env.CLIENT_URL);
-console.log('========================================');
 
 /* =====================================================
    CORS
@@ -40,55 +28,65 @@ console.log('========================================');
 const allowedOrigins = [
   'http://localhost:5173',
   'http://localhost:5174',
-  'https://event-management-system-vairam.netlify.app',
-
-  ...(process.env.CLIENT_URL
-    ? process.env.CLIENT_URL
-        .split(',')
-        .map((url) => url.trim())
-        .filter(Boolean)
-    : [])
+  'https://event-management-system-vairam.netlify.app'
 ];
+
+if (process.env.CLIENT_URL) {
+  process.env.CLIENT_URL
+    .split(',')
+    .map((url) => url.trim())
+    .filter(Boolean)
+    .forEach((url) => {
+      if (!allowedOrigins.includes(url)) {
+        allowedOrigins.push(url);
+      }
+    });
+}
 
 console.log('Allowed CORS origins:', allowedOrigins);
 
-app.use(
-  cors({
-    origin: function (origin, callback) {
-      // Allow Postman/server-to-server requests
-      // where there is no Origin header.
-      if (!origin) {
-        return callback(null, true);
-      }
+const corsOptions = {
+  origin: function (origin, callback) {
+    // Allow requests without an Origin header
+    // such as Postman or server-to-server requests.
+    if (!origin) {
+      return callback(null, true);
+    }
 
-      if (allowedOrigins.includes(origin)) {
-        return callback(null, true);
-      }
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
 
-      console.log('CORS blocked origin:', origin);
+    console.log('CORS blocked origin:', origin);
 
-      return callback(
-        new Error(`CORS blocked: ${origin}`)
-      );
-    },
+    return callback(null, false);
+  },
 
-    credentials: true,
+  credentials: true,
 
-    methods: [
-      'GET',
-      'POST',
-      'PUT',
-      'PATCH',
-      'DELETE',
-      'OPTIONS'
-    ],
+  methods: [
+    'GET',
+    'POST',
+    'PUT',
+    'PATCH',
+    'DELETE',
+    'OPTIONS'
+  ],
 
-    allowedHeaders: [
-      'Content-Type',
-      'Authorization'
-    ]
-  })
-);
+  allowedHeaders: [
+    'Content-Type',
+    'Authorization'
+  ],
+
+  optionsSuccessStatus: 204
+};
+
+app.use(cors(corsOptions));
+
+/*
+  Explicitly handle browser preflight requests.
+*/
+app.options(/.*/, cors(corsOptions));
 
 /* =====================================================
    BODY PARSERS
@@ -113,21 +111,15 @@ app.get('/api/health', (req, res) => {
 ===================================================== */
 
 app.use('/api/auth', authRoutes);
-
 app.use('/api/events', eventRoutes);
-
 app.use('/api/tickets', ticketRoutes);
-
 app.use('/api/users', userRoutes);
-
 app.use('/api/admin', adminRoutes);
-
 app.use('/api/analytics', analyticsRoutes);
-
 app.use('/api/support', supportRoutes);
 
 /* =====================================================
-   404 HANDLER
+   404
 ===================================================== */
 
 app.use((req, res) => {
@@ -150,25 +142,23 @@ app.use((err, req, res, next) => {
 });
 
 /* =====================================================
-   START EXPRESS SERVER
+   START SERVER
 ===================================================== */
 
-/*
-  IMPORTANT:
-  Start Express BEFORE connecting to MongoDB.
-
-  Render needs to detect that the application
-  is listening on process.env.PORT.
-*/
+console.log('========================================');
+console.log('Starting EventHub API');
+console.log('PORT:', port);
+console.log('MONGO_URI exists:', !!process.env.MONGO_URI);
+console.log('JWT_SECRET exists:', !!process.env.JWT_SECRET);
+console.log('CLIENT_URL:', process.env.CLIENT_URL);
+console.log('========================================');
 
 app.listen(port, () => {
-  console.log('========================================');
   console.log(`API running on port ${port}`);
-  console.log('========================================');
 });
 
 /* =====================================================
-   MONGODB CONNECTION
+   MONGODB
 ===================================================== */
 
 console.log('Connecting to MongoDB...');
@@ -179,13 +169,9 @@ mongoose
     connectTimeoutMS: 15000
   })
   .then(() => {
-    console.log('========================================');
     console.log('MongoDB connected successfully');
-    console.log('========================================');
   })
   .catch((err) => {
-    console.error('========================================');
-    console.error('MongoDB connection failed');
+    console.error('MongoDB connection failed:');
     console.error(err);
-    console.error('========================================');
   });
