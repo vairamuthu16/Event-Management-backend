@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
 import mongoose from 'mongoose';
+import cors from 'cors';
 
 import './models/index.js';
 
@@ -23,16 +24,15 @@ const allowedOrigins = [
 ];
 
 if (process.env.CLIENT_URL) {
-  const extraOrigins = process.env.CLIENT_URL
+  process.env.CLIENT_URL
     .split(',')
     .map((url) => url.trim())
-    .filter(Boolean);
-
-  extraOrigins.forEach((origin) => {
-    if (!allowedOrigins.includes(origin)) {
-      allowedOrigins.push(origin);
-    }
-  });
+    .filter(Boolean)
+    .forEach((url) => {
+      if (!allowedOrigins.includes(url)) {
+        allowedOrigins.push(url);
+      }
+    });
 }
 
 console.log('========================================');
@@ -45,110 +45,63 @@ console.log('Allowed CORS origins:', allowedOrigins);
 console.log('========================================');
 
 
-/*
-|--------------------------------------------------------------------------
-| CORS
-|--------------------------------------------------------------------------
-*/
-
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-
-  if (origin && allowedOrigins.includes(origin)) {
-    res.header(
-      'Access-Control-Allow-Origin',
-      origin
-    );
-
-    res.header(
-      'Access-Control-Allow-Credentials',
-      'true'
-    );
-
-    res.header(
-      'Access-Control-Allow-Methods',
-      'GET,POST,PUT,PATCH,DELETE,OPTIONS'
-    );
-
-    res.header(
-      'Access-Control-Allow-Headers',
-      'Content-Type, Authorization'
-    );
-
-    res.header(
-      'Access-Control-Max-Age',
-      '86400'
-    );
-  }
-
-  /*
-  |--------------------------------------------------------------------------
-  | Handle browser preflight
-  |--------------------------------------------------------------------------
-  */
-
-  if (req.method === 'OPTIONS') {
-    console.log(
-      'CORS preflight:',
-      origin,
-      req.originalUrl
-    );
-
-    if (
-      origin &&
-      allowedOrigins.includes(origin)
-    ) {
-      return res.status(204).end();
-    }
-
-    return res.status(403).json({
-      message: 'CORS origin not allowed'
-    });
-  }
-
-  next();
-});
-
-
-/*
-|--------------------------------------------------------------------------
-| Body parser
-|--------------------------------------------------------------------------
-*/
+// --------------------------------------------------
+// CORS
+// --------------------------------------------------
 
 app.use(
-  express.json({
-    limit: '2mb'
-  })
-);
+  cors({
+    origin: function (origin, callback) {
 
-app.use(
-  express.urlencoded({
-    extended: true
+      // Allow requests without an Origin header
+      // such as curl/Postman/server-to-server requests.
+      if (!origin) {
+        return callback(null, true);
+      }
+
+      if (allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+
+      console.log('CORS blocked:', origin);
+
+      return callback(
+        new Error(`CORS blocked: ${origin}`)
+      );
+    },
+
+    credentials: true,
+
+    methods: [
+      'GET',
+      'POST',
+      'PUT',
+      'PATCH',
+      'DELETE',
+      'OPTIONS'
+    ],
+
+    allowedHeaders: [
+      'Content-Type',
+      'Authorization'
+    ],
+
+    optionsSuccessStatus: 204
   })
 );
 
 
-/*
-|--------------------------------------------------------------------------
-| Root
-|--------------------------------------------------------------------------
-*/
+// --------------------------------------------------
+// Body parser
+// --------------------------------------------------
 
-app.get('/', (req, res) => {
-  res.json({
-    ok: true,
-    service: 'EventHub API',
-    message: 'Backend is running'
-  });
-});
+app.use(express.json({ limit: '2mb' }));
+app.use(express.urlencoded({ extended: true }));
 
 
-/*
-|--------------------------------------------------------------------------
-| Health
-|--------------------------------------------------------------------------
-*/
+// --------------------------------------------------
+// Health checks
+// --------------------------------------------------
 
 app.get('/health', (req, res) => {
   res.json({
@@ -156,7 +109,6 @@ app.get('/health', (req, res) => {
     service: 'eventhub-api'
   });
 });
-
 
 app.get('/api/health', (req, res) => {
   res.json({
@@ -166,11 +118,9 @@ app.get('/api/health', (req, res) => {
 });
 
 
-/*
-|--------------------------------------------------------------------------
-| API routes
-|--------------------------------------------------------------------------
-*/
+// --------------------------------------------------
+// API routes
+// --------------------------------------------------
 
 app.use('/api/auth', authRoutes);
 
@@ -187,11 +137,9 @@ app.use('/api/analytics', analyticsRoutes);
 app.use('/api/support', supportRoutes);
 
 
-/*
-|--------------------------------------------------------------------------
-| 404
-|--------------------------------------------------------------------------
-*/
+// --------------------------------------------------
+// 404
+// --------------------------------------------------
 
 app.use((req, res) => {
   console.log(
@@ -207,57 +155,28 @@ app.use((req, res) => {
 });
 
 
-/*
-|--------------------------------------------------------------------------
-| Error handler
-|--------------------------------------------------------------------------
-*/
+// --------------------------------------------------
+// Error handler
+// --------------------------------------------------
 
 app.use((err, req, res, next) => {
-  console.error(
-    'Server error:',
-    err
-  );
+  console.error('Server error:', err);
 
   res.status(err.status || 500).json({
-    message:
-      err.message || 'Server error'
+    message: err.message || 'Server error'
   });
 });
 
 
-/*
-|--------------------------------------------------------------------------
-| Start server
-|--------------------------------------------------------------------------
-*/
+// --------------------------------------------------
+// MongoDB + Server
+// --------------------------------------------------
 
-async function startServer() {
-  try {
+mongoose
+  .connect(process.env.MONGO_URI)
+  .then(() => {
 
-    if (!process.env.MONGO_URI) {
-      throw new Error(
-        'MONGO_URI is missing'
-      );
-    }
-
-    if (!process.env.JWT_SECRET) {
-      throw new Error(
-        'JWT_SECRET is missing'
-      );
-    }
-
-    console.log(
-      'Connecting to MongoDB...'
-    );
-
-    await mongoose.connect(
-      process.env.MONGO_URI
-    );
-
-    console.log(
-      'MongoDB connected successfully'
-    );
+    console.log('MongoDB connected successfully');
 
     app.listen(
       PORT,
@@ -269,13 +188,13 @@ async function startServer() {
         );
 
         console.log(
-          `Health: http://0.0.0.0:${PORT}/api/health`
+          `Health: http://0.0.0.0:${PORT}/health`
         );
-
       }
     );
 
-  } catch (error) {
+  })
+  .catch((error) => {
 
     console.error(
       'MongoDB connection failed:',
@@ -283,7 +202,4 @@ async function startServer() {
     );
 
     process.exit(1);
-  }
-}
-
-startServer();
+  });
