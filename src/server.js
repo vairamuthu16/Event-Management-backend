@@ -28,9 +28,9 @@ if (process.env.CLIENT_URL) {
     .split(',')
     .map((url) => url.trim())
     .filter(Boolean)
-    .forEach((url) => {
-      if (!allowedOrigins.includes(url)) {
-        allowedOrigins.push(url);
+    .forEach((origin) => {
+      if (!allowedOrigins.includes(origin)) {
+        allowedOrigins.push(origin);
       }
     });
 }
@@ -45,16 +45,14 @@ console.log('Allowed CORS origins:', allowedOrigins);
 console.log('========================================');
 
 
-// --------------------------------------------------
-// CORS
-// --------------------------------------------------
+/* =========================================================
+   CORS
+========================================================= */
 
 app.use(
   cors({
     origin: function (origin, callback) {
-
-      // Allow requests without an Origin header
-      // such as curl/Postman/server-to-server requests.
+      // Allow requests without Origin, such as curl/server requests
       if (!origin) {
         return callback(null, true);
       }
@@ -63,11 +61,9 @@ app.use(
         return callback(null, true);
       }
 
-      console.log('CORS blocked:', origin);
+      console.log('CORS blocked origin:', origin);
 
-      return callback(
-        new Error(`CORS blocked: ${origin}`)
-      );
+      return callback(new Error(`CORS blocked: ${origin}`));
     },
 
     credentials: true,
@@ -84,43 +80,52 @@ app.use(
     allowedHeaders: [
       'Content-Type',
       'Authorization'
-    ],
-
-    optionsSuccessStatus: 204
+    ]
   })
 );
 
 
-// --------------------------------------------------
-// Body parser
-// --------------------------------------------------
+/* =========================================================
+   BODY PARSING
+========================================================= */
 
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true }));
 
 
-// --------------------------------------------------
-// Health checks
-// --------------------------------------------------
+/* =========================================================
+   HEALTH CHECKS
+========================================================= */
 
-app.get('/health', (req, res) => {
+// Simple root route
+app.get('/', (req, res) => {
   res.json({
     ok: true,
-    service: 'eventhub-api'
+    service: 'eventhub-api',
+    message: 'EventHub backend is running'
   });
 });
 
+// Main health route
 app.get('/api/health', (req, res) => {
-  res.json({
+  res.status(200).json({
+    ok: true,
+    service: 'eventhub-api'
+  });
+});
+
+// Additional health route
+app.get('/health', (req, res) => {
+  res.status(200).json({
     ok: true,
     service: 'eventhub-api'
   });
 });
 
 
-// --------------------------------------------------
-// API routes
-// --------------------------------------------------
+/* =========================================================
+   API ROUTES
+========================================================= */
 
 app.use('/api/auth', authRoutes);
 
@@ -137,16 +142,12 @@ app.use('/api/analytics', analyticsRoutes);
 app.use('/api/support', supportRoutes);
 
 
-// --------------------------------------------------
-// 404
-// --------------------------------------------------
+/* =========================================================
+   404 HANDLER
+========================================================= */
 
 app.use((req, res) => {
-  console.log(
-    '404:',
-    req.method,
-    req.originalUrl
-  );
+  console.log('404:', req.method, req.originalUrl);
 
   res.status(404).json({
     message: 'API route not found',
@@ -155,9 +156,9 @@ app.use((req, res) => {
 });
 
 
-// --------------------------------------------------
-// Error handler
-// --------------------------------------------------
+/* =========================================================
+   ERROR HANDLER
+========================================================= */
 
 app.use((err, req, res, next) => {
   console.error('Server error:', err);
@@ -168,38 +169,21 @@ app.use((err, req, res, next) => {
 });
 
 
-// --------------------------------------------------
-// MongoDB + Server
-// --------------------------------------------------
+/* =========================================================
+   MONGODB + SERVER
+========================================================= */
 
 mongoose
   .connect(process.env.MONGO_URI)
   .then(() => {
-
     console.log('MongoDB connected successfully');
 
-    app.listen(
-      PORT,
-      '0.0.0.0',
-      () => {
-
-        console.log(
-          `API running on 0.0.0.0:${PORT}`
-        );
-
-        console.log(
-          `Health: http://0.0.0.0:${PORT}/health`
-        );
-      }
-    );
-
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log(`API running on 0.0.0.0:${PORT}`);
+      console.log(`Health: http://0.0.0.0:${PORT}/api/health`);
+    });
   })
   .catch((error) => {
-
-    console.error(
-      'MongoDB connection failed:',
-      error
-    );
-
+    console.error('MongoDB connection failed:', error);
     process.exit(1);
   });
