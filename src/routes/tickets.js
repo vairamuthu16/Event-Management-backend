@@ -8,110 +8,367 @@ import {
 } from '../models/index.js';
 
 import {
-  protect,
-  roles
+  requireAuth,
+  requireRole
 } from '../middleware/auth.js';
-
-import {
-  sendEmail
-} from '../utils/email.js';
 
 const router = express.Router();
 
+const razorpay =
+  process.env.RAZORPAY_KEY_ID &&
+  process.env.RAZORPAY_KEY_SECRET
+    ? new Razorpay({
+        key_id: process.env.RAZORPAY_KEY_ID,
+        key_secret: process.env.RAZORPAY_KEY_SECRET
+      })
+    : null;
+
 /*
 |--------------------------------------------------------------------------
-| RAZORPAY
+| Helper functions
 |--------------------------------------------------------------------------
 */
 
-const getRazorpay = () => {
-  if (
-    !process.env.RAZORPAY_KEY_ID ||
-    !process.env.RAZORPAY_KEY_SECRET
-  ) {
-    const error = new Error(
-      'Razorpay is not configured. Add RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET to server environment variables.'
-    );
+function getTicket(event, ticketTypeId) {
+  return event.ticketTypes?.id(ticketTypeId);
+}
 
-    error.status = 503;
-    throw error;
-  }
+function getAvailableTickets(ticket) {
+  if (!ticket) return 0;
 
-  return new Razorpay({
-    key_id: process.env.RAZORPAY_KEY_ID,
-    key_secret: process.env.RAZORPAY_KEY_SECRET
-  });
-};
+  return Math.max(
+    0,
+    Number(ticket.quantity || 0) -
+      Number(ticket.sold || 0)
+  );
+}
 
+function isEventPast(event) {
+  if (!event?.date) return false;
+
+  return new Date(event.date).getTime() < Date.now();
+}
 
 /*
 |--------------------------------------------------------------------------
-| CREATE RAZORPAY ORDER
+| GET /api/tickets/mine
+|--------------------------------------------------------------------------
+| Get the logged-in user's registrations.
+*/
+
+router.get('/mine', requireAuth, async (req, res) => {
+  try {
+    const registrations =
+      await Registration.find({
+        user: req.user._id
+      })
+        .populate(
+          'event',
+          'title date time location image category organizer ticketTypes sessions status'
+        )
+        .sort({
+          createdAt: -1
+        });
+
+    res.json(registrations);
+  } catch (error) {
+    console.error(
+      'Get my tickets error:',
+      error
+    );
+
+    res.status(500).json({
+      message:
+        'Failed to load your registrations'
+    });
+  }
+});
+
+/*
+|--------------------------------------------------------------------------
+| GET /api/tickets/:id
+|--------------------------------------------------------------------------
+| Get one registration owned by the logged-in user.
+*/
+
+router.get('/:id', requireAuth, async (req, res) => {
+  try {
+    const registration =
+      await Registration.findOne({
+        _id: req.params.id,
+        user: req.user._id
+      }).populate(
+        'event',
+        'title date time location image category organizer ticketTypes sessions status'
+      );
+
+    if (!registration) {
+      return res.status(404).json({
+        message: 'Registration not found'
+      });
+    }
+
+    res.json(registration);
+  } catch (error) {
+    console.error(
+      'Get ticket error:',
+      error
+    );
+
+    res.status(500).json({
+      message:
+        'Failed to load registration'
+    });
+  }
+});
+
+/*
+|--------------------------------------------------------------------------
+| GET /api/tickets/event/:eventId
+|--------------------------------------------------------------------------
+| Organizer/admin can view registrations for an event.
+|
+| IMPORTANT:
+| This route must appear BEFORE /:id.
+|--------------------------------------------------------------------------
+*/
+
+router.get(
+  '/event/:eventId',
+  requireAuth,
+  requireRole('organizer', 'admin'),
+  async (req, res) => {
+    try {
+      const event =
+        await Event.findById(
+          req.params.eventId
+        );
+
+      if (!event) {
+        return res.status(404).json({
+          message: 'Event not found'
+        });
+      }
+
+      if (
+        req.user.role === 'organizer' &&
+        String(event.organizer) !==
+          String(req.user._id)
+      ) {
+        return res.status(403).json({
+          message:
+            'You can only view registrations for your own events'
+        });
+      }
+
+      const registrations =
+        await Registration.find({
+          event: event._id
+        })
+          .populate(
+            'user',
+            'name email role'
+          )
+          .populate(
+            'event',
+            'title date time location'
+          )
+          .sort({
+            createdAt: -1
+          });
+
+      res.json(registrations);
+    } catch (error) {
+      console.error(
+        'Get event registrations error:',
+        error
+      );
+
+      res.status(500).json({
+        message:
+          'Failed to load event registrations'
+      });
+    }
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
 | POST /api/tickets/create-order
+|--------------------------------------------------------------------------
+| Create a ticket registration and Razorpay order.
 |--------------------------------------------------------------------------
 */
 
 router.post(
   '/create-order',
-  protect,
+  requireAuth,
   async (req, res) => {
     try {
+      if (!razorpay) {
+        return res.status(500).json({
+          message:
+            'Razorpay is not configured on the server'
+        });
+      }
+
       const {
         eventId,
         ticketTypeId,
+        quantity,
         attendee
       } = req.body;
 
-      const quantity = Number(
-        req.body.quantity ?? 1
-      );
+      const numericQuantity =
+        Number(quantity);
+
+      if (!eventId) {
+        return res.status(400).json({
+          message: 'Event is required'
+        });
+      }
+
+      if (!ticketTypeId) {
+        return res.status(400).json({
+          message:
+            'Ticket type is required'
+        });
+      }
 
       if (
-        !Number.isInteger(quantity) ||
-        quantity < 1 ||
-        quantity > 10
+        !Number.isInteger(
+          numericQuantity
+        ) ||
+        numericQuantity < 1
       ) {
         return res.status(400).json({
           message:
-            'Quantity must be an integer between 1 and 10'
+            'Quantity must be at least 1'
         });
       }
 
-      const event = await Event.findById(eventId);
+      if (numericQuantity > 10) {
+        return res.status(400).json({
+          message:
+            'You can purchase a maximum of 10 tickets per order'
+        });
+      }
+
+      const event =
+        await Event.findById(eventId);
+
+      if (!event) {
+        return res.status(404).json({
+          message: 'Event not found'
+        });
+      }
+
+      if (event.status !== 'approved') {
+        return res.status(400).json({
+          message:
+            'Tickets are available only for approved events'
+        });
+      }
+
+      if (isEventPast(event)) {
+        return res.status(400).json({
+          message:
+            'This event has already started or ended'
+        });
+      }
+
+      const ticket =
+        getTicket(
+          event,
+          ticketTypeId
+        );
+
+      if (!ticket) {
+        return res.status(404).json({
+          message:
+            'Ticket type not found'
+        });
+      }
+
+      const available =
+        getAvailableTickets(ticket);
+
+      if (available <= 0) {
+        return res.status(400).json({
+          message:
+            'This ticket type is sold out'
+        });
+      }
 
       if (
-        !event ||
-        event.status !== 'approved'
-      ) {
-        return res.status(404).json({
-          message: 'Event unavailable'
-        });
-      }
-
-      const type =
-        event.ticketTypes.id(ticketTypeId);
-
-      if (!type) {
-        return res.status(404).json({
-          message: 'Ticket type not found'
-        });
-      }
-
-      if (
-        type.sold + quantity >
-        type.quantity
+        numericQuantity >
+        available
       ) {
         return res.status(400).json({
           message:
-            'Not enough tickets available'
+            `Only ${available} ticket(s) are available`
+        });
+      }
+
+      /*
+      |--------------------------------------------------------------------------
+      | Prevent duplicate active registrations only when appropriate.
+      |
+      | Multiple purchases are still allowed.
+      |--------------------------------------------------------------------------
+      */
+
+      const attendeeName =
+        String(
+          attendee?.name ||
+            req.user.name ||
+            ''
+        ).trim();
+
+      const attendeeEmail =
+        String(
+          attendee?.email ||
+            req.user.email ||
+            ''
+        )
+          .trim()
+          .toLowerCase();
+
+      const attendeePhone =
+        String(
+          attendee?.phone || ''
+        ).trim();
+
+      if (!attendeeName) {
+        return res.status(400).json({
+          message:
+            'Attendee name is required'
+        });
+      }
+
+      if (!attendeeEmail) {
+        return res.status(400).json({
+          message:
+            'Attendee email is required'
         });
       }
 
       const amount =
-        Number(type.price) * quantity;
+        Number(ticket.price || 0) *
+        numericQuantity;
 
-      const razorpay =
-        getRazorpay();
+      if (amount < 0) {
+        return res.status(400).json({
+          message:
+            'Invalid ticket price'
+        });
+      }
+
+      /*
+      |--------------------------------------------------------------------------
+      | Create Razorpay order
+      |--------------------------------------------------------------------------
+      */
 
       const order =
         await razorpay.orders.create({
@@ -119,62 +376,102 @@ router.post(
             amount * 100
           ),
           currency: 'INR',
-          receipt:
-            `evt_${event._id}_${Date.now()}`
+          receipt: `event_${String(
+            event._id
+          ).slice(-8)}_${Date.now()}`,
+          notes: {
+            eventId: String(
+              event._id
+            ),
+            ticketTypeId: String(
+              ticket._id
+            ),
+            userId: String(
+              req.user._id
+            ),
+            quantity: String(
+              numericQuantity
+            )
+          }
         });
+
+      /*
+      |--------------------------------------------------------------------------
+      | Create registration.
+      |
+      | Tickets are NOT marked sold yet.
+      | sold is updated only after successful payment verification.
+      |--------------------------------------------------------------------------
+      */
 
       const registration =
         await Registration.create({
           user: req.user._id,
           event: event._id,
-          ticketType: type._id,
-          quantity,
+          ticketType: ticket._id,
+          quantity: numericQuantity,
           amount,
           paymentStatus: 'created',
           razorpayOrderId: order.id,
-          attendee:
-            attendee || {
-              name: req.user.name,
-              email: req.user.email
-            }
+          status: 'active',
+          attendee: {
+            name: attendeeName,
+            email: attendeeEmail,
+            phone: attendeePhone
+          }
         });
 
-      res.json({
-        order,
+      res.status(201).json({
         registrationId:
           registration._id,
         keyId:
-          process.env.RAZORPAY_KEY_ID
+          process.env.RAZORPAY_KEY_ID,
+        order: {
+          id: order.id,
+          amount: order.amount,
+          currency:
+            order.currency
+        },
+        event: {
+          id: event._id,
+          title: event.title
+        },
+        ticket: {
+          id: ticket._id,
+          name: ticket.name,
+          price: ticket.price,
+          quantity:
+            numericQuantity,
+          available
+        }
       });
-
     } catch (error) {
       console.error(
-        'Create Razorpay order error:',
+        'Create ticket order error:',
         error
       );
 
-      res.status(
-        error.status || 500
-      ).json({
+      res.status(500).json({
         message:
-          error.message ||
-          'Failed to create payment order'
+          error?.error?.description ||
+          error?.message ||
+          'Failed to create ticket order'
       });
     }
   }
 );
 
-
 /*
 |--------------------------------------------------------------------------
-| VERIFY RAZORPAY PAYMENT
 | POST /api/tickets/verify
+|--------------------------------------------------------------------------
+| Verify Razorpay payment signature.
 |--------------------------------------------------------------------------
 */
 
 router.post(
   '/verify',
-  protect,
+  requireAuth,
   async (req, res) => {
     try {
       const {
@@ -184,11 +481,23 @@ router.post(
         razorpay_signature
       } = req.body;
 
+      if (
+        !registrationId ||
+        !razorpay_order_id ||
+        !razorpay_payment_id ||
+        !razorpay_signature
+      ) {
+        return res.status(400).json({
+          message:
+            'Payment verification details are incomplete'
+        });
+      }
+
       const registration =
         await Registration.findOne({
           _id: registrationId,
           user: req.user._id
-        }).populate('event');
+        });
 
       if (!registration) {
         return res.status(404).json({
@@ -197,27 +506,29 @@ router.post(
         });
       }
 
+      /*
+      |--------------------------------------------------------------------------
+      | Already verified
+      |--------------------------------------------------------------------------
+      */
+
       if (
         registration.paymentStatus ===
-        'paid'
+          'paid' &&
+        registration.razorpayPaymentId
       ) {
         return res.json({
           message:
-            'Payment already verified',
+            'Payment has already been verified',
           registration
         });
       }
 
-      if (
-        !razorpay_order_id ||
-        !razorpay_payment_id ||
-        !razorpay_signature
-      ) {
-        return res.status(400).json({
-          message:
-            'Incomplete Razorpay payment response'
-        });
-      }
+      /*
+      |--------------------------------------------------------------------------
+      | Check order ID.
+      |--------------------------------------------------------------------------
+      */
 
       if (
         registration.razorpayOrderId !==
@@ -225,88 +536,109 @@ router.post(
       ) {
         return res.status(400).json({
           message:
-            'Order ID does not match'
+            'Payment order does not match registration'
         });
       }
 
       /*
       |--------------------------------------------------------------------------
-      | VERIFY RAZORPAY SIGNATURE
+      | Verify Razorpay HMAC signature.
       |--------------------------------------------------------------------------
       */
 
-      const expected =
+      const body =
+        `${razorpay_order_id}|${razorpay_payment_id}`;
+
+      const expectedSignature =
         crypto
           .createHmac(
             'sha256',
             process.env.RAZORPAY_KEY_SECRET
           )
-          .update(
-            `${razorpay_order_id}|${razorpay_payment_id}`
-          )
+          .update(body)
           .digest('hex');
 
-      const validSignature =
-        expected.length ===
-          razorpay_signature.length &&
-        crypto.timingSafeEqual(
-          Buffer.from(expected),
-          Buffer.from(
-            razorpay_signature
-          )
-        );
+      if (
+        expectedSignature !==
+        razorpay_signature
+      ) {
+        registration.paymentStatus =
+          'failed';
 
-      if (!validSignature) {
+        await registration.save();
+
         return res.status(400).json({
           message:
-            'Payment verification failed'
+            'Invalid payment signature'
         });
       }
 
       /*
       |--------------------------------------------------------------------------
-      | CHECK EVENT
+      | Reload event after payment.
+      |
+      | We check inventory again because another
+      | customer may have purchased tickets while
+      | the Razorpay checkout was open.
       |--------------------------------------------------------------------------
       */
 
       const event =
         await Event.findById(
-          registration.event._id
+          registration.event
         );
 
       if (!event) {
+        registration.paymentStatus =
+          'failed';
+
+        await registration.save();
+
         return res.status(404).json({
           message:
             'Event no longer exists'
         });
       }
 
-      /*
-      |--------------------------------------------------------------------------
-      | CHECK TICKET AVAILABILITY
-      |--------------------------------------------------------------------------
-      */
-
-      const type =
-        event.ticketTypes.id(
+      const ticket =
+        getTicket(
+          event,
           registration.ticketType
         );
 
-      if (
-        !type ||
-        type.sold +
-          registration.quantity >
-          type.quantity
-      ) {
+      if (!ticket) {
+        registration.paymentStatus =
+          'failed';
+
+        await registration.save();
+
         return res.status(400).json({
           message:
-            'Tickets are no longer available'
+            'Ticket type no longer exists'
+        });
+      }
+
+      const available =
+        getAvailableTickets(ticket);
+
+      if (
+        registration.quantity >
+        available
+      ) {
+        registration.paymentStatus =
+          'failed';
+
+        await registration.save();
+
+        return res.status(409).json({
+          message:
+            'Sorry, there are not enough tickets remaining for this ticket type'
         });
       }
 
       /*
       |--------------------------------------------------------------------------
-      | MARK PAYMENT AS PAID
+      | Mark payment as paid.
       |--------------------------------------------------------------------------
       */
 
@@ -323,65 +655,35 @@ router.post(
 
       /*
       |--------------------------------------------------------------------------
-      | UPDATE SOLD TICKETS
+      | Increase sold count.
       |--------------------------------------------------------------------------
       */
 
-      type.sold +=
-        registration.quantity;
+      ticket.sold =
+        Number(ticket.sold || 0) +
+        Number(
+          registration.quantity || 0
+        );
 
       await event.save();
 
-      /*
-      |--------------------------------------------------------------------------
-      | SEND CONFIRMATION EMAIL
-      |--------------------------------------------------------------------------
-      */
-
-      try {
-        await sendEmail({
-          to: req.user.email,
-          subject:
-            `Registration confirmed: ${event.title}`,
-          html: `
-            <h2>Registration confirmed</h2>
-
-            <p>
-              You are registered for
-              <b>${event.title}</b>.
-            </p>
-
-            <p>
-              Tickets:
-              ${registration.quantity}
-            </p>
-
-            <p>
-              Amount:
-              ₹${registration.amount}
-            </p>
-          `
-        });
-      } catch (emailError) {
-        /*
-        Email failure should not make
-        a successful Razorpay payment fail.
-        */
-        console.error(
-          'Confirmation email error:',
-          emailError
+      const updatedRegistration =
+        await Registration.findById(
+          registration._id
+        ).populate(
+          'event',
+          'title date time location image category'
         );
-      }
 
       res.json({
         message:
-          'Payment verified',
-        registration
+          'Payment verified and registration confirmed',
+        registration:
+          updatedRegistration
       });
-
     } catch (error) {
       console.error(
-        'Payment verification error:',
+        'Verify payment error:',
         error
       );
 
@@ -393,294 +695,24 @@ router.post(
   }
 );
 
-
 /*
 |--------------------------------------------------------------------------
-| GET MY TICKETS
-| GET /api/tickets/mine
-|--------------------------------------------------------------------------
-*/
-
-router.get(
-  '/mine',
-  protect,
-  async (req, res) => {
-    try {
-      const registrations =
-        await Registration.find({
-          user: req.user._id
-        })
-          .populate('event')
-          .populate(
-            'user',
-            'name email'
-          )
-          .sort({
-            createdAt: -1
-          });
-
-      res.json(registrations);
-
-    } catch (error) {
-      console.error(
-        'Get my tickets error:',
-        error
-      );
-
-      res.status(500).json({
-        message:
-          'Failed to load tickets'
-      });
-    }
-  }
-);
-
-
-/*
-|--------------------------------------------------------------------------
-| GET SINGLE TICKET
-| GET /api/tickets/:id
-|--------------------------------------------------------------------------
-|
-| IMPORTANT:
-| This route appears AFTER /mine.
-| Otherwise "mine" could be treated as an ID.
-|--------------------------------------------------------------------------
-*/
-
-router.get(
-  '/:id',
-  protect,
-  async (req, res) => {
-    try {
-      const registration =
-        await Registration.findById(
-          req.params.id
-        )
-          .populate('event')
-          .populate(
-            'user',
-            'name email'
-          );
-
-      if (!registration) {
-        return res.status(404).json({
-          message:
-            'Ticket not found'
-        });
-      }
-
-      const ticketUserId =
-        registration.user?._id?.toString() ||
-        registration.user?.toString();
-
-      if (
-        ticketUserId !==
-        req.user._id.toString()
-      ) {
-        return res.status(403).json({
-          message:
-            'Access denied'
-        });
-      }
-
-      res.json(registration);
-
-    } catch (error) {
-      console.error(
-        'Get ticket error:',
-        error
-      );
-
-      res.status(500).json({
-        message:
-          'Failed to load ticket'
-      });
-    }
-  }
-);
-
-
-/*
-|--------------------------------------------------------------------------
-| LEGACY CREATE TICKET
-| POST /api/tickets
-|--------------------------------------------------------------------------
-|
-| Kept for compatibility with existing frontend code.
-|
-| NOTE:
-| Razorpay purchases should use /create-order
-| followed by /verify.
-|--------------------------------------------------------------------------
-*/
-
-router.post(
-  '/',
-  protect,
-  async (req, res) => {
-    try {
-      const {
-        eventId,
-        ticketType,
-        quantity = 1
-      } = req.body;
-
-      if (!eventId) {
-        return res.status(400).json({
-          message:
-            'Event ID is required'
-        });
-      }
-
-      const event =
-        await Event.findById(
-          eventId
-        );
-
-      if (!event) {
-        return res.status(404).json({
-          message:
-            'Event not found'
-        });
-      }
-
-      if (
-        event.status !==
-        'approved'
-      ) {
-        return res.status(400).json({
-          message:
-            'This event is not available for registration'
-        });
-      }
-
-      /*
-      Find a real ticket type if an
-      ObjectId was supplied.
-      */
-      let selectedTicketType = null;
-
-      if (ticketType) {
-        selectedTicketType =
-          event.ticketTypes.id(
-            ticketType
-          );
-      }
-
-      /*
-      Fall back to the first ticket type
-      if one exists.
-      */
-      if (
-        !selectedTicketType &&
-        event.ticketTypes.length
-      ) {
-        selectedTicketType =
-          event.ticketTypes[0];
-      }
-
-      if (!selectedTicketType) {
-        return res.status(400).json({
-          message:
-            'No ticket type available'
-        });
-      }
-
-      const ticketQuantity =
-        Number(quantity) || 1;
-
-      if (
-        ticketQuantity < 1 ||
-        ticketQuantity > 10
-      ) {
-        return res.status(400).json({
-          message:
-            'Quantity must be between 1 and 10'
-        });
-      }
-
-      if (
-        selectedTicketType.sold +
-          ticketQuantity >
-        selectedTicketType.quantity
-      ) {
-        return res.status(400).json({
-          message:
-            'Not enough tickets available'
-        });
-      }
-
-      const registration =
-        await Registration.create({
-          user: req.user._id,
-          event: event._id,
-          ticketType:
-            selectedTicketType._id,
-          quantity:
-            ticketQuantity,
-          amount:
-            Number(
-              selectedTicketType.price
-            ) *
-            ticketQuantity,
-          paymentStatus:
-            'paid',
-          status:
-            'active'
-        });
-
-      selectedTicketType.sold +=
-        ticketQuantity;
-
-      await event.save();
-
-      const populatedRegistration =
-        await Registration.findById(
-          registration._id
-        )
-          .populate('event')
-          .populate(
-            'user',
-            'name email'
-          );
-
-      res.status(201).json(
-        populatedRegistration
-      );
-
-    } catch (error) {
-      console.error(
-        'Create ticket error:',
-        error
-      );
-
-      res.status(500).json({
-        message:
-          'Failed to create ticket'
-      });
-    }
-  }
-);
-
-
-/*
-|--------------------------------------------------------------------------
-| CANCEL TICKET
 | PATCH /api/tickets/:id/cancel
+|--------------------------------------------------------------------------
+| Cancel an active paid registration.
 |--------------------------------------------------------------------------
 */
 
 router.patch(
   '/:id/cancel',
-  protect,
+  requireAuth,
   async (req, res) => {
     try {
       const registration =
         await Registration.findOne({
           _id: req.params.id,
           user: req.user._id
-        }).populate('event');
+        });
 
       if (!registration) {
         return res.status(404).json({
@@ -695,72 +727,248 @@ router.patch(
       ) {
         return res.status(400).json({
           message:
-            'Registration already inactive'
+            'This registration is already cancelled or transferred'
         });
       }
 
-      registration.status =
-        'cancelled';
-
-      await registration.save();
-
-      /*
-      Return sold tickets only when
-      payment was actually completed.
-      */
       if (
-        registration.paymentStatus ===
+        registration.paymentStatus !==
         'paid'
       ) {
-        const event =
-          await Event.findById(
-            registration.event._id
-          );
+        registration.status =
+          'cancelled';
 
-        const type =
-          event?.ticketTypes.id(
+        await registration.save();
+
+        return res.json({
+          message:
+            'Registration cancelled',
+          registration
+        });
+      }
+
+      const event =
+        await Event.findById(
+          registration.event
+        );
+
+      /*
+      |--------------------------------------------------------------------------
+      | Reduce sold count when cancelling a paid ticket.
+      |--------------------------------------------------------------------------
+      */
+
+      if (event) {
+        const ticket =
+          getTicket(
+            event,
             registration.ticketType
           );
 
-        if (type) {
-          type.sold =
+        if (ticket) {
+          ticket.sold =
             Math.max(
               0,
-              type.sold -
-                registration.quantity
+              Number(
+                ticket.sold || 0
+              ) -
+                Number(
+                  registration.quantity ||
+                    0
+                )
             );
 
           await event.save();
         }
       }
 
-      res.json(registration);
+      registration.status =
+        'cancelled';
 
+      registration.paymentStatus =
+        'refunded';
+
+      await registration.save();
+
+      const updatedRegistration =
+        await Registration.findById(
+          registration._id
+        ).populate(
+          'event',
+          'title date time location image category'
+        );
+
+      res.json({
+        message:
+          'Registration cancelled successfully',
+        registration:
+          updatedRegistration
+      });
     } catch (error) {
       console.error(
-        'Cancel ticket error:',
+        'Cancel registration error:',
         error
       );
 
       res.status(500).json({
         message:
-          'Failed to cancel ticket'
+          'Failed to cancel registration'
       });
     }
   }
 );
 
+/*
+|--------------------------------------------------------------------------
+| PATCH /api/tickets/:id/transfer
+|--------------------------------------------------------------------------
+| Transfer an active ticket to another attendee.
+|--------------------------------------------------------------------------
+*/
+
+router.patch(
+  '/:id/transfer',
+  requireAuth,
+  async (req, res) => {
+    try {
+      const {
+        name,
+        email,
+        phone
+      } = req.body;
+
+      const registration =
+        await Registration.findOne({
+          _id: req.params.id,
+          user: req.user._id
+        }).populate(
+          'event',
+          'title date status'
+        );
+
+      if (!registration) {
+        return res.status(404).json({
+          message:
+            'Registration not found'
+        });
+      }
+
+      if (
+        registration.status !==
+        'active'
+      ) {
+        return res.status(400).json({
+          message:
+            'Only active registrations can be transferred'
+        });
+      }
+
+      if (
+        registration.paymentStatus !==
+        'paid'
+      ) {
+        return res.status(400).json({
+          message:
+            'Only paid registrations can be transferred'
+        });
+      }
+
+      if (
+        registration.event?.status !==
+        'approved'
+      ) {
+        return res.status(400).json({
+          message:
+            'This event is not available for transfer'
+        });
+      }
+
+      if (
+        isEventPast(
+          registration.event
+        )
+      ) {
+        return res.status(400).json({
+          message:
+            'Tickets cannot be transferred after the event has started'
+        });
+      }
+
+      const newName =
+        String(name || '').trim();
+
+      const newEmail =
+        String(email || '')
+          .trim()
+          .toLowerCase();
+
+      const newPhone =
+        String(phone || '').trim();
+
+      if (!newName) {
+        return res.status(400).json({
+          message:
+            'New attendee name is required'
+        });
+      }
+
+      if (!newEmail) {
+        return res.status(400).json({
+          message:
+            'New attendee email is required'
+        });
+      }
+
+      registration.attendee = {
+        name: newName,
+        email: newEmail,
+        phone: newPhone
+      };
+
+      registration.status =
+        'transferred';
+
+      await registration.save();
+
+      const updatedRegistration =
+        await Registration.findById(
+          registration._id
+        ).populate(
+          'event',
+          'title date time location image category'
+        );
+
+      res.json({
+        message:
+          'Ticket transferred successfully',
+        registration:
+          updatedRegistration
+      });
+    } catch (error) {
+      console.error(
+        'Transfer ticket error:',
+        error
+      );
+
+      res.status(500).json({
+        message:
+          'Failed to transfer ticket'
+      });
+    }
+  }
+);
 
 /*
 |--------------------------------------------------------------------------
-| SUBMIT TICKET FEEDBACK
 | PATCH /api/tickets/:id/feedback
+|--------------------------------------------------------------------------
+| Attendee feedback after attending an event.
 |--------------------------------------------------------------------------
 */
 
 router.patch(
   '/:id/feedback',
-  protect,
+  requireAuth,
   async (req, res) => {
     try {
       const {
@@ -785,8 +993,12 @@ router.patch(
       }
 
       const registration =
-        await Registration.findById(
-          req.params.id
+        await Registration.findOne({
+          _id: req.params.id,
+          user: req.user._id
+        }).populate(
+          'event',
+          'title date'
         );
 
       if (!registration) {
@@ -796,44 +1008,28 @@ router.patch(
         });
       }
 
-      const ticketUserId =
-        registration.user?._id?.toString() ||
-        registration.user?.toString();
-
-      const loggedInUserId =
-        req.user._id.toString();
-
-      if (
-        ticketUserId !==
-        loggedInUserId
-      ) {
-        return res.status(403).json({
-          message:
-            'You can only submit feedback for your own ticket'
-        });
-      }
-
-      /*
-      Feedback should normally be
-      submitted for a completed/paid ticket.
-      */
       if (
         registration.paymentStatus !==
         'paid'
       ) {
         return res.status(400).json({
           message:
-            'Feedback is available only for paid tickets'
+            'Only paid registrations can receive feedback'
+        });
+      }
+
+      if (!registration.attended) {
+        return res.status(400).json({
+          message:
+            'Feedback can be submitted after attendance is recorded'
         });
       }
 
       registration.feedback = {
-        rating:
-          numericRating,
-        comment:
-          String(
-            comment || ''
-          ).trim()
+        rating: numericRating,
+        comment: String(
+          comment || ''
+        ).trim()
       };
 
       await registration.save();
@@ -841,47 +1037,52 @@ router.patch(
       const updatedRegistration =
         await Registration.findById(
           registration._id
-        )
-          .populate('event')
-          .populate(
-            'user',
-            'name email'
-          );
+        ).populate(
+          'event',
+          'title date time location image category'
+        );
 
       res.json(
         updatedRegistration
       );
-
     } catch (error) {
       console.error(
-        'Submit feedback error:',
+        'Ticket feedback error:',
         error
       );
 
       res.status(500).json({
         message:
-          'Failed to submit feedback'
+          'Failed to save feedback'
       });
     }
   }
 );
 
-
 /*
 |--------------------------------------------------------------------------
-| MARK ATTENDANCE
 | PATCH /api/tickets/:id/attendance
+|--------------------------------------------------------------------------
+| Organizer/admin records attendance.
 |--------------------------------------------------------------------------
 */
 
 router.patch(
   '/:id/attendance',
-  protect,
+  requireAuth,
+  requireRole('organizer', 'admin'),
   async (req, res) => {
     try {
+      const {
+        attended
+      } = req.body;
+
       const registration =
         await Registration.findById(
           req.params.id
+        ).populate(
+          'event',
+          'title organizer date'
         );
 
       if (!registration) {
@@ -891,17 +1092,16 @@ router.patch(
         });
       }
 
-      const ticketUserId =
-        registration.user?._id?.toString() ||
-        registration.user?.toString();
-
       if (
-        ticketUserId !==
-        req.user._id.toString()
+        req.user.role ===
+          'organizer' &&
+        String(
+          registration.event?.organizer
+        ) !== String(req.user._id)
       ) {
         return res.status(403).json({
           message:
-            'Access denied'
+            'You can only update attendance for your own events'
         });
       }
 
@@ -911,12 +1111,12 @@ router.patch(
       ) {
         return res.status(400).json({
           message:
-            'Only paid tickets can be marked as attended'
+            'Only paid registrations can be marked as attended'
         });
       }
 
       registration.attended =
-        true;
+        Boolean(attended);
 
       await registration.save();
 
@@ -924,19 +1124,26 @@ router.patch(
         await Registration.findById(
           registration._id
         )
-          .populate('event')
           .populate(
             'user',
-            'name email'
+            'name email role'
+          )
+          .populate(
+            'event',
+            'title date time location'
           );
 
-      res.json(
-        updatedRegistration
-      );
-
+      res.json({
+        message:
+          registration.attended
+            ? 'Attendance recorded'
+            : 'Attendance removed',
+        registration:
+          updatedRegistration
+      });
     } catch (error) {
       console.error(
-        'Mark attendance error:',
+        'Attendance update error:',
         error
       );
 
@@ -948,21 +1155,21 @@ router.patch(
   }
 );
 
-
 /*
 |--------------------------------------------------------------------------
-| GET EVENT REGISTRATIONS
-| GET /api/tickets/event/:eventId
+| GET /api/tickets/event/:eventId/export
+|--------------------------------------------------------------------------
+| Organizer/admin attendee export.
+|
+| Returns CSV so the organizer can download/export
+| the attendee list.
 |--------------------------------------------------------------------------
 */
 
 router.get(
-  '/event/:eventId',
-  protect,
-  roles(
-    'organizer',
-    'admin'
-  ),
+  '/event/:eventId/export',
+  requireAuth,
+  requireRole('organizer', 'admin'),
   async (req, res) => {
     try {
       const event =
@@ -972,58 +1179,145 @@ router.get(
 
       if (!event) {
         return res.status(404).json({
-          message:
-            'Event not found'
+          message: 'Event not found'
         });
       }
 
-      /*
-      Organizers can only view
-      their own event registrations.
-      Admins can view all events.
-      */
       if (
-        req.user.role !==
-          'admin' &&
+        req.user.role === 'organizer' &&
         String(event.organizer) !==
           String(req.user._id)
       ) {
         return res.status(403).json({
           message:
-            'You can only view registrations for your own events'
+            'You can only export attendees for your own events'
         });
       }
 
       const registrations =
         await Registration.find({
-          event:
-            req.params.eventId
+          event: event._id
         })
           .populate(
             'user',
             'name email'
           )
           .sort({
-            createdAt: -1
+            createdAt: 1
           });
 
-      res.json(
-        registrations
+      const escapeCsv = (value) => {
+        const text =
+          String(value ?? '');
+
+        return `"${text.replace(
+          /"/g,
+          '""'
+        )}"`;
+      };
+
+      const rows = [
+        [
+          'Registration ID',
+          'Attendee Name',
+          'Attendee Email',
+          'Phone',
+          'Ticket Type',
+          'Quantity',
+          'Amount',
+          'Payment Status',
+          'Registration Status',
+          'Attendance',
+          'Created At'
+        ]
+      ];
+
+      for (const registration of registrations) {
+        const ticket =
+          event.ticketTypes?.id(
+            registration.ticketType
+          );
+
+        rows.push([
+          registration._id,
+          registration.attendee
+            ?.name ||
+            registration.user
+              ?.name ||
+            '',
+          registration.attendee
+            ?.email ||
+            registration.user
+              ?.email ||
+            '',
+          registration.attendee
+            ?.phone ||
+            '',
+          ticket?.name ||
+            'Ticket',
+          registration.quantity ||
+            0,
+          registration.amount ||
+            0,
+          registration.paymentStatus ||
+            '',
+          registration.status ||
+            '',
+          registration.attended
+            ? 'Yes'
+            : 'No',
+          registration.createdAt
+            ? new Date(
+                registration.createdAt
+              ).toISOString()
+            : ''
+        ]);
+      }
+
+      const csv =
+        rows
+          .map((row) =>
+            row
+              .map(escapeCsv)
+              .join(',')
+          )
+          .join('\n');
+
+      const filename =
+        `${event.title
+          .replace(
+            /[^a-z0-9]+/gi,
+            '-'
+          )
+          .replace(
+            /^-+|-+$/g,
+            ''
+          )
+          .toLowerCase() || 'event'}-attendees.csv`;
+
+      res.setHeader(
+        'Content-Type',
+        'text/csv; charset=utf-8'
       );
 
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="${filename}"`
+      );
+
+      res.send(csv);
     } catch (error) {
       console.error(
-        'Get event registrations error:',
+        'Export attendees error:',
         error
       );
 
       res.status(500).json({
         message:
-          'Failed to load event registrations'
+          'Failed to export attendees'
       });
     }
   }
 );
-
 
 export default router;
