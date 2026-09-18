@@ -1,4 +1,5 @@
 import express from 'express';
+import mongoose from 'mongoose';
 
 import {
   Event,
@@ -6,479 +7,719 @@ import {
 } from '../models/index.js';
 
 import {
-  protect,
-  roles
+  requireAuth,
+  requireRole
 } from '../middleware/auth.js';
 
 const router = express.Router();
 
 /*
 |--------------------------------------------------------------------------
-| Event Analytics
+| Helpers
 |--------------------------------------------------------------------------
 */
 
-router.get(
-  '/event/:eventId',
-  protect,
-  roles('organizer', 'admin'),
-  async (req, res) => {
-    try {
-      const event = await Event.findById(req.params.eventId);
+function toNumber(value) {
+  const number = Number(value);
 
-      if (!event) {
-        return res.status(404).json({
-          message: 'Event not found'
-        });
-      }
+  return Number.isFinite(number)
+    ? number
+    : 0;
+}
 
-      if (
-        req.user.role !== 'admin' &&
-        String(event.organizer) !== String(req.user._id)
-      ) {
-        return res.status(403).json({
-          message: 'Not your event'
-        });
-      }
+function round(value, decimals = 1) {
+  const multiplier =
+    10 ** decimals;
 
-      const regs = await Registration.find({
-        event: event._id
-      });
-
-      const paid = regs.filter(
-        (r) =>
-          r.paymentStatus === 'paid' &&
-          r.status !== 'cancelled'
-      );
-
-      const ticketsSold = paid.reduce(
-        (sum, r) => sum + (Number(r.quantity) || 0),
-        0
-      );
-
-      const revenue = paid.reduce(
-        (sum, r) => sum + (Number(r.amount) || 0),
-        0
-      );
-
-      const attended = paid.reduce(
-        (sum, r) =>
-          sum +
-          (r.attended
-            ? Number(r.quantity) || 0
-            : 0),
-        0
-      );
-
-      const attendanceRate =
-        ticketsSold > 0
-          ? Number(
-              ((attended / ticketsSold) * 100).toFixed(2)
-            )
-          : 0;
-
-      const ratings = regs
-        .map((r) => Number(r.feedback?.rating))
-        .filter(
-          (rating) =>
-            Number.isFinite(rating) &&
-            rating >= 1 &&
-            rating <= 5
-        );
-
-      const averageRating =
-        ratings.length > 0
-          ? Number(
-              (
-                ratings.reduce(
-                  (sum, rating) => sum + rating,
-                  0
-                ) / ratings.length
-              ).toFixed(2)
-            )
-          : 0;
-
-      const feedbackCount = ratings.length;
-
-      const byTicket = {};
-
-      paid.forEach((r) => {
-        const ticketTypeId = String(r.ticketType);
-
-        byTicket[ticketTypeId] =
-          (byTicket[ticketTypeId] || 0) +
-          (Number(r.quantity) || 0);
-      });
-
-      res.json({
-        event: {
-          id: event._id,
-          title: event.title,
-          capacity:
-            event.capacity ||
-            event.ticketTypes.reduce(
-              (sum, ticket) =>
-                sum + (Number(ticket.quantity) || 0),
-              0
-            )
-        },
-
-        registrations: regs.length,
-
-        ticketsSold,
-
-        revenue,
-
-        attended,
-
-        attendanceRate,
-
-        averageRating,
-
-        feedbackCount,
-
-        ticketBreakdown: event.ticketTypes.map(
-          (ticket) => ({
-            name: ticket.name,
-            sold:
-              byTicket[String(ticket._id)] || 0,
-            capacity: ticket.quantity,
-            price: ticket.price
-          })
-        )
-      });
-    } catch (error) {
-      console.error(
-        'Event analytics error:',
-        error
-      );
-
-      res.status(500).json({
-        message: 'Failed to load event analytics'
-      });
-    }
-  }
-);
-
+  return (
+    Math.round(
+      Number(value) * multiplier
+    ) / multiplier
+  );
+}
 
 /*
 |--------------------------------------------------------------------------
-| Organizer Analytics
+| GET /api/analytics/organizer
+|--------------------------------------------------------------------------
+|
+| Organizer dashboard analytics.
+|
+| Returns:
+| - totalEvents
+| - ticketsSold
+| - revenue
+| - attendanceRate
+| - averageRating
+| - feedbackCount
+| - totalAttended
+| - salesByEvent
+| - revenueByEvent
+| - attendanceByEvent
+| - revenueTrend
+| - events
+|
 |--------------------------------------------------------------------------
 */
 
 router.get(
   '/organizer',
-  protect,
-  roles('organizer', 'admin'),
+  requireAuth,
+  requireRole('organizer'),
   async (req, res) => {
     try {
+      const organizerId =
+        req.user._id;
+
       /*
-       * Organizers only see their own events.
-       * Admins can see all events.
-       */
-      const eventFilter =
-        req.user.role === 'admin'
-          ? {}
-          : {
-              organizer: req.user._id
+      |--------------------------------------------------------------------------
+      | Load organizer events
+      |--------------------------------------------------------------------------
+      */
+
+      const events =
+        await Event.find({
+          organizer: organizerId
+        })
+          .sort({
+            date: 1
+          })
+          .lean();
+
+      const eventIds =
+        events.map(
+          (event) =>
+            event._id
+        );
+
+      /*
+      |--------------------------------------------------------------------------
+      | If organizer has no events
+      |--------------------------------------------------------------------------
+      */
+
+      if (!eventIds.length) {
+        return res.json({
+          totalEvents: 0,
+          ticketsSold: 0,
+          revenue: 0,
+          attendanceRate: 0,
+          averageRating: 0,
+          feedbackCount: 0,
+          totalAttended: 0,
+
+          salesByEvent: [],
+          revenueByEvent: [],
+          attendanceByEvent: [],
+          revenueTrend: [],
+
+          events: []
+        });
+      }
+
+      /*
+      |--------------------------------------------------------------------------
+      | Load registrations
+      |--------------------------------------------------------------------------
+      |
+      | We intentionally load all registrations for these events.
+      |
+      | Paid registrations are used for:
+      | - tickets sold
+      | - revenue
+      | - attendance
+      | - attendee feedback
+      |
+      */
+
+      const registrations =
+        await Registration.find({
+          event: {
+            $in: eventIds
+          }
+        }).lean();
+
+      /*
+      |--------------------------------------------------------------------------
+      | Create event map
+      |--------------------------------------------------------------------------
+      */
+
+      const eventMap =
+        new Map();
+
+      events.forEach(
+        (event) => {
+          eventMap.set(
+            String(event._id),
+            event
+          );
+        }
+      );
+
+      /*
+      |--------------------------------------------------------------------------
+      | Create statistics map
+      |--------------------------------------------------------------------------
+      */
+
+      const statistics =
+        new Map();
+
+      events.forEach(
+        (event) => {
+          statistics.set(
+            String(event._id),
+            {
+              id: event._id,
+
+              title:
+                event.title,
+
+              status:
+                event.status,
+
+              sold: 0,
+
+              attended: 0,
+
+              revenue: 0,
+
+              feedbackCount: 0,
+
+              ratingTotal: 0,
+
+              averageRating: 0,
+
+              attendanceRate: 0
+            }
+          );
+        }
+      );
+
+      /*
+      |--------------------------------------------------------------------------
+      | Process registrations
+      |--------------------------------------------------------------------------
+      */
+
+      registrations.forEach(
+        (registration) => {
+          const eventId =
+            String(
+              registration.event
+            );
+
+          const stats =
+            statistics.get(
+              eventId
+            );
+
+          if (!stats) {
+            return;
+          }
+
+          /*
+          |--------------------------------------------------------------------------
+          | Only paid registrations count as sales.
+          |--------------------------------------------------------------------------
+          */
+
+          const isPaid =
+            registration.paymentStatus ===
+            'paid';
+
+          if (!isPaid) {
+            return;
+          }
+
+          /*
+          |--------------------------------------------------------------------------
+          | Quantity
+          |--------------------------------------------------------------------------
+          */
+
+          const quantity =
+            Math.max(
+              0,
+              toNumber(
+                registration.quantity
+              )
+            );
+
+          /*
+          |--------------------------------------------------------------------------
+          | Tickets sold
+          |--------------------------------------------------------------------------
+          */
+
+          stats.sold +=
+            quantity;
+
+          /*
+          |--------------------------------------------------------------------------
+          | Revenue
+          |--------------------------------------------------------------------------
+          */
+
+          stats.revenue +=
+            toNumber(
+              registration.amount
+            );
+
+          /*
+          |--------------------------------------------------------------------------
+          | Attendance
+          |--------------------------------------------------------------------------
+          |
+          | One registration can contain
+          | multiple tickets.
+          |
+          | If attended=true, count the
+          | registration quantity.
+          |--------------------------------------------------------------------------
+          */
+
+          if (
+            registration.attended ===
+            true
+          ) {
+            stats.attended +=
+              quantity;
+          }
+
+          /*
+          |--------------------------------------------------------------------------
+          | Feedback
+          |--------------------------------------------------------------------------
+          */
+
+          const rating =
+            toNumber(
+              registration
+                .feedback
+                ?.rating
+            );
+
+          if (
+            rating >= 1 &&
+            rating <= 5
+          ) {
+            stats.ratingTotal +=
+              rating;
+
+            stats.feedbackCount +=
+              1;
+          }
+        }
+      );
+
+      /*
+      |--------------------------------------------------------------------------
+      | Calculate event-level metrics
+      |--------------------------------------------------------------------------
+      */
+
+      const eventPerformance =
+        Array.from(
+          statistics.values()
+        ).map(
+          (stats) => {
+            const attendanceRate =
+              stats.sold > 0
+                ? (
+                    stats.attended /
+                    stats.sold
+                  ) *
+                  100
+                : 0;
+
+            const averageRating =
+              stats.feedbackCount >
+              0
+                ? stats.ratingTotal /
+                  stats.feedbackCount
+                : 0;
+
+            return {
+              _id: stats.id,
+
+              id: stats.id,
+
+              title:
+                stats.title,
+
+              status:
+                stats.status,
+
+              sold:
+                stats.sold,
+
+              attended:
+                stats.attended,
+
+              attendanceRate:
+                round(
+                  attendanceRate,
+                  1
+                ),
+
+              revenue:
+                round(
+                  stats.revenue,
+                  2
+                ),
+
+              averageRating:
+                round(
+                  averageRating,
+                  1
+                ),
+
+              feedbackCount:
+                stats.feedbackCount
             };
-
-      const events = await Event.find(eventFilter)
-        .sort({ createdAt: -1 });
-
-      const eventIds = events.map(
-        (event) => event._id
-      );
+          }
+        );
 
       /*
-       * Only paid registrations are included
-       * in sales/revenue/attendance analytics.
-       */
-      const regs =
-        eventIds.length > 0
-          ? await Registration.find({
-              event: { $in: eventIds },
-              paymentStatus: 'paid',
-              status: { $ne: 'cancelled' }
-            }).sort({ createdAt: 1 })
-          : [];
+      |--------------------------------------------------------------------------
+      | Summary metrics
+      |--------------------------------------------------------------------------
+      */
+
+      const totalEvents =
+        events.length;
+
+      const ticketsSold =
+        eventPerformance.reduce(
+          (
+            total,
+            event
+          ) =>
+            total +
+            event.sold,
+          0
+        );
+
+      const totalAttended =
+        eventPerformance.reduce(
+          (
+            total,
+            event
+          ) =>
+            total +
+            event.attended,
+          0
+        );
+
+      const revenue =
+        eventPerformance.reduce(
+          (
+            total,
+            event
+          ) =>
+            total +
+            event.revenue,
+          0
+        );
 
       /*
-       * Overall ticket sales
-       */
-      const ticketsSold = regs.reduce(
-        (sum, registration) =>
-          sum +
-          (Number(registration.quantity) || 0),
-        0
-      );
-
-      /*
-       * Overall revenue
-       */
-      const revenue = regs.reduce(
-        (sum, registration) =>
-          sum +
-          (Number(registration.amount) || 0),
-        0
-      );
-
-      /*
-       * Overall attendance
-       */
-      const attended = regs.reduce(
-        (sum, registration) =>
-          sum +
-          (registration.attended
-            ? Number(registration.quantity) || 0
-            : 0),
-        0
-      );
+      |--------------------------------------------------------------------------
+      | Overall attendance rate
+      |--------------------------------------------------------------------------
+      */
 
       const attendanceRate =
         ticketsSold > 0
-          ? Number(
-              (
-                (attended / ticketsSold) *
-                100
-              ).toFixed(2)
-            )
+          ? (
+              totalAttended /
+              ticketsSold
+            ) *
+            100
           : 0;
 
       /*
-       * Overall feedback / rating
-       */
-      const ratings = regs
-        .map((registration) =>
-          Number(
-            registration.feedback?.rating
-          )
-        )
-        .filter(
-          (rating) =>
-            Number.isFinite(rating) &&
-            rating >= 1 &&
-            rating <= 5
-        );
+      |--------------------------------------------------------------------------
+      | Overall rating
+      |--------------------------------------------------------------------------
+      |
+      | Weighted by feedback count.
+      |
+      | Example:
+      |
+      | Event A = 5 rating, 1 feedback
+      | Event B = 4 rating, 3 feedback
+      |
+      | Overall:
+      |
+      | (5×1 + 4×3) / 4
+      |--------------------------------------------------------------------------
+      */
 
-      const feedbackCount = ratings.length;
+      let ratingTotal = 0;
+
+      let feedbackCount = 0;
+
+      eventPerformance.forEach(
+        (event) => {
+          if (
+            event.averageRating >
+              0 &&
+            event.feedbackCount >
+              0
+          ) {
+            ratingTotal +=
+              event.averageRating *
+              event.feedbackCount;
+
+            feedbackCount +=
+              event.feedbackCount;
+          }
+        }
+      );
 
       const averageRating =
         feedbackCount > 0
-          ? Number(
-              (
-                ratings.reduce(
-                  (sum, rating) =>
-                    sum + rating,
-                  0
-                ) / feedbackCount
-              ).toFixed(2)
-            )
+          ? ratingTotal /
+            feedbackCount
           : 0;
 
       /*
-       * Event-level analytics
-       */
-      const eventPerformance = events.map(
-        (event) => {
-          const eventRegs = regs.filter(
-            (registration) =>
-              String(registration.event) ===
-              String(event._id)
-          );
+      |--------------------------------------------------------------------------
+      | Sales by event
+      |--------------------------------------------------------------------------
+      */
 
-          const sold = eventRegs.reduce(
-            (sum, registration) =>
-              sum +
-              (Number(registration.quantity) || 0),
-            0
-          );
+      const salesByEvent =
+        eventPerformance.map(
+          (event) => ({
+            id: event.id,
 
-          const eventRevenue =
-            eventRegs.reduce(
-              (sum, registration) =>
-                sum +
-                (Number(registration.amount) || 0),
-              0
-            );
+            name:
+              event.title,
 
-          const eventAttended =
-            eventRegs.reduce(
-              (sum, registration) =>
-                sum +
-                (registration.attended
-                  ? Number(
-                      registration.quantity
-                    ) || 0
-                  : 0),
-              0
-            );
+            title:
+              event.title,
 
-          const eventAttendanceRate =
-            sold > 0
-              ? Number(
-                  (
-                    (eventAttended / sold) *
-                    100
-                  ).toFixed(2)
-                )
-              : 0;
+            value:
+              event.sold,
 
-          const eventRatings =
-            eventRegs
-              .map((registration) =>
-                Number(
-                  registration.feedback?.rating
-                )
-              )
-              .filter(
-                (rating) =>
-                  Number.isFinite(rating) &&
-                  rating >= 1 &&
-                  rating <= 5
-              );
+            sold:
+              event.sold
+          })
+        );
 
-          const eventFeedbackCount =
-            eventRatings.length;
+      /*
+      |--------------------------------------------------------------------------
+      | Revenue by event
+      |--------------------------------------------------------------------------
+      */
 
-          const eventAverageRating =
-            eventFeedbackCount > 0
-              ? Number(
-                  (
-                    eventRatings.reduce(
-                      (sum, rating) =>
-                        sum + rating,
-                      0
-                    ) /
-                    eventFeedbackCount
-                  ).toFixed(2)
-                )
-              : 0;
+      const revenueByEvent =
+        eventPerformance.map(
+          (event) => ({
+            id: event.id,
 
-          return {
-            id: event._id,
-            title: event.title,
-            status: event.status,
+            name:
+              event.title,
 
-            sold,
+            title:
+              event.title,
 
-            attended: eventAttended,
+            value:
+              event.revenue,
+
+            revenue:
+              event.revenue
+          })
+        );
+
+      /*
+      |--------------------------------------------------------------------------
+      | Attendance by event
+      |--------------------------------------------------------------------------
+      */
+
+      const attendanceByEvent =
+        eventPerformance.map(
+          (event) => ({
+            id: event.id,
+
+            name:
+              event.title,
+
+            title:
+              event.title,
+
+            value:
+              event.attendanceRate,
 
             attendanceRate:
-              eventAttendanceRate,
+              event.attendanceRate,
 
-            revenue: eventRevenue,
+            sold:
+              event.sold,
 
-            averageRating:
-              eventAverageRating,
-
-            feedbackCount:
-              eventFeedbackCount
-          };
-        }
-      );
+            attended:
+              event.attended
+          })
+        );
 
       /*
-       * Ticket sales chart
-       */
-      const salesByEvent =
-        eventPerformance.map((event) => ({
-          name: event.title,
-          value: event.sold
-        }));
+      |--------------------------------------------------------------------------
+      | Revenue trend
+      |--------------------------------------------------------------------------
+      |
+      | Group paid registrations by date.
+      |--------------------------------------------------------------------------
+      */
 
-      /*
-       * Revenue chart
-       */
-      const revenueByEvent =
-        eventPerformance.map((event) => ({
-          name: event.title,
-          value: event.revenue
-        }));
+      const revenueTrendMap =
+        new Map();
 
-      /*
-       * Revenue trend
-       *
-       * Group paid registrations by month.
-       */
-      const revenueTrendMap = {};
+      registrations.forEach(
+        (registration) => {
+          if (
+            registration.paymentStatus !==
+            'paid'
+          ) {
+            return;
+          }
 
-      regs.forEach((registration) => {
-        const date =
-          registration.createdAt
-            ? new Date(
-                registration.createdAt
+          const event =
+            eventMap.get(
+              String(
+                registration.event
               )
-            : null;
+            );
 
-        if (
-          !date ||
-          Number.isNaN(date.getTime())
-        ) {
-          return;
+          if (!event) {
+            return;
+          }
+
+          const createdAt =
+            registration.createdAt;
+
+          if (!createdAt) {
+            return;
+          }
+
+          const date =
+            new Date(
+              createdAt
+            );
+
+          if (
+            Number.isNaN(
+              date.getTime()
+            )
+          ) {
+            return;
+          }
+
+          /*
+            YYYY-MM-DD
+          */
+
+          const key =
+            date
+              .toISOString()
+              .slice(0, 10);
+
+          const existing =
+            revenueTrendMap.get(
+              key
+            ) || {
+              date: key,
+              revenue: 0,
+              ticketsSold: 0
+            };
+
+          existing.revenue +=
+            toNumber(
+              registration.amount
+            );
+
+          existing.ticketsSold +=
+            Math.max(
+              0,
+              toNumber(
+                registration.quantity
+              )
+            );
+
+          revenueTrendMap.set(
+            key,
+            existing
+          );
         }
-
-        const year = date.getFullYear();
-
-        const month = String(
-          date.getMonth() + 1
-        ).padStart(2, '0');
-
-        const key = `${year}-${month}`;
-
-        if (!revenueTrendMap[key]) {
-          revenueTrendMap[key] = {
-            name: key,
-            value: 0
-          };
-        }
-
-        revenueTrendMap[key].value +=
-          Number(registration.amount) || 0;
-      });
-
-      const revenueTrend = Object.values(
-        revenueTrendMap
-      ).sort((a, b) =>
-        a.name.localeCompare(b.name)
       );
 
+      const revenueTrend =
+        Array.from(
+          revenueTrendMap.values()
+        )
+          .sort(
+            (a, b) =>
+              new Date(a.date) -
+              new Date(b.date)
+          )
+          .map(
+            (item) => ({
+              ...item,
+
+              revenue:
+                round(
+                  item.revenue,
+                  2
+                )
+            })
+          );
+
       /*
-       * Response used by Organizer.jsx
-       */
-      res.json({
-        totalEvents: events.length,
+      |--------------------------------------------------------------------------
+      | Final response
+      |--------------------------------------------------------------------------
+      */
 
-        approved: events.filter(
-          (event) =>
-            event.status === 'approved'
-        ).length,
-
-        pending: events.filter(
-          (event) =>
-            event.status === 'pending'
-        ).length,
+      return res.json({
+        totalEvents,
 
         ticketsSold,
 
-        revenue,
+        revenue:
+          round(
+            revenue,
+            2
+          ),
 
-        attended,
+        attendanceRate:
+          round(
+            attendanceRate,
+            1
+          ),
 
-        attendanceRate,
-
-        averageRating,
+        averageRating:
+          round(
+            averageRating,
+            1
+          ),
 
         feedbackCount,
+
+        totalAttended,
 
         salesByEvent,
 
         revenueByEvent,
 
+        attendanceByEvent,
+
         revenueTrend,
 
-        events: eventPerformance
+        events:
+          eventPerformance
       });
     } catch (error) {
       console.error(
@@ -486,9 +727,447 @@ router.get(
         error
       );
 
-      res.status(500).json({
+      return res.status(500).json({
         message:
-          'Failed to load organizer analytics'
+          'Failed to load organizer analytics.'
+      });
+    }
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
+| GET /api/analytics/event/:eventId
+|--------------------------------------------------------------------------
+|
+| Analytics for one event.
+|
+| Accessible to:
+| - organizer who owns the event
+| - admin
+|
+|--------------------------------------------------------------------------
+*/
+
+router.get(
+  '/event/:eventId',
+  requireAuth,
+  requireRole(
+    'organizer',
+    'admin'
+  ),
+  async (req, res) => {
+    try {
+      const {
+        eventId
+      } = req.params;
+
+      if (
+        !mongoose.Types.ObjectId.isValid(
+          eventId
+        )
+      ) {
+        return res.status(400).json({
+          message:
+            'Invalid event ID.'
+        });
+      }
+
+      const event =
+        await Event.findById(
+          eventId
+        ).lean();
+
+      if (!event) {
+        return res.status(404).json({
+          message:
+            'Event not found.'
+        });
+      }
+
+      /*
+      |--------------------------------------------------------------------------
+      | Organizer ownership check
+      |--------------------------------------------------------------------------
+      */
+
+      if (
+        req.user.role ===
+          'organizer' &&
+        String(
+          event.organizer
+        ) !==
+          String(
+            req.user._id
+          )
+      ) {
+        return res.status(403).json({
+          message:
+            'You can only view analytics for your own events.'
+        });
+      }
+
+      /*
+      |--------------------------------------------------------------------------
+      | Registrations
+      |--------------------------------------------------------------------------
+      */
+
+      const registrations =
+        await Registration.find({
+          event: eventId
+        }).lean();
+
+      let ticketsSold = 0;
+
+      let revenue = 0;
+
+      let attended = 0;
+
+      let feedbackCount = 0;
+
+      let ratingTotal = 0;
+
+      registrations.forEach(
+        (registration) => {
+          if (
+            registration.paymentStatus !==
+            'paid'
+          ) {
+            return;
+          }
+
+          const quantity =
+            Math.max(
+              0,
+              toNumber(
+                registration.quantity
+              )
+            );
+
+          ticketsSold +=
+            quantity;
+
+          revenue +=
+            toNumber(
+              registration.amount
+            );
+
+          if (
+            registration.attended ===
+            true
+          ) {
+            attended +=
+              quantity;
+          }
+
+          const rating =
+            toNumber(
+              registration
+                .feedback
+                ?.rating
+            );
+
+          if (
+            rating >= 1 &&
+            rating <= 5
+          ) {
+            ratingTotal +=
+              rating;
+
+            feedbackCount +=
+              1;
+          }
+        }
+      );
+
+      const attendanceRate =
+        ticketsSold > 0
+          ? (
+              attended /
+              ticketsSold
+            ) *
+            100
+          : 0;
+
+      const averageRating =
+        feedbackCount > 0
+          ? ratingTotal /
+            feedbackCount
+          : 0;
+
+      /*
+      |--------------------------------------------------------------------------
+      | Ticket inventory
+      |--------------------------------------------------------------------------
+      */
+
+      const ticketTypes =
+        (
+          event.ticketTypes ||
+          []
+        ).map(
+          (ticket) => {
+            const quantity =
+              toNumber(
+                ticket.quantity
+              );
+
+            const sold =
+              toNumber(
+                ticket.sold
+              );
+
+            return {
+              _id:
+                ticket._id,
+
+              name:
+                ticket.name,
+
+              price:
+                toNumber(
+                  ticket.price
+                ),
+
+              quantity,
+
+              sold,
+
+              available:
+                Math.max(
+                  0,
+                  quantity -
+                    sold
+                )
+            };
+          }
+        );
+
+      /*
+      |--------------------------------------------------------------------------
+      | Response
+      |--------------------------------------------------------------------------
+      */
+
+      return res.json({
+        event: {
+          _id:
+            event._id,
+
+          title:
+            event.title,
+
+          status:
+            event.status,
+
+          date:
+            event.date,
+
+          location:
+            event.location
+        },
+
+        totalRegistrations:
+          registrations.length,
+
+        ticketsSold,
+
+        attended,
+
+        attendanceRate:
+          round(
+            attendanceRate,
+            1
+          ),
+
+        revenue:
+          round(
+            revenue,
+            2
+          ),
+
+        averageRating:
+          round(
+            averageRating,
+            1
+          ),
+
+        feedbackCount,
+
+        ticketTypes
+      });
+    } catch (error) {
+      console.error(
+        'Event analytics error:',
+        error
+      );
+
+      return res.status(500).json({
+        message:
+          'Failed to load event analytics.'
+      });
+    }
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
+| GET /api/analytics/admin
+|--------------------------------------------------------------------------
+|
+| Admin analytics.
+|
+| This is kept separate from organizer
+| analytics so organizers only see their
+| own events.
+|
+|--------------------------------------------------------------------------
+*/
+
+router.get(
+  '/admin',
+  requireAuth,
+  requireRole('admin'),
+  async (req, res) => {
+    try {
+      const events =
+        await Event.find({})
+          .sort({
+            date: 1
+          })
+          .lean();
+
+      const eventIds =
+        events.map(
+          (event) =>
+            event._id
+        );
+
+      const registrations =
+        eventIds.length
+          ? await Registration.find({
+              event: {
+                $in: eventIds
+              }
+            }).lean()
+          : [];
+
+      let ticketsSold = 0;
+
+      let revenue = 0;
+
+      let attended = 0;
+
+      let feedbackCount = 0;
+
+      let ratingTotal = 0;
+
+      registrations.forEach(
+        (registration) => {
+          if (
+            registration.paymentStatus !==
+            'paid'
+          ) {
+            return;
+          }
+
+          const quantity =
+            Math.max(
+              0,
+              toNumber(
+                registration.quantity
+              )
+            );
+
+          ticketsSold +=
+            quantity;
+
+          revenue +=
+            toNumber(
+              registration.amount
+            );
+
+          if (
+            registration.attended ===
+            true
+          ) {
+            attended +=
+              quantity;
+          }
+
+          const rating =
+            toNumber(
+              registration
+                .feedback
+                ?.rating
+            );
+
+          if (
+            rating >= 1 &&
+            rating <= 5
+          ) {
+            ratingTotal +=
+              rating;
+
+            feedbackCount +=
+              1;
+          }
+        }
+      );
+
+      const attendanceRate =
+        ticketsSold > 0
+          ? (
+              attended /
+              ticketsSold
+            ) *
+            100
+          : 0;
+
+      const averageRating =
+        feedbackCount > 0
+          ? ratingTotal /
+            feedbackCount
+          : 0;
+
+      return res.json({
+        totalEvents:
+          events.length,
+
+        ticketsSold,
+
+        revenue:
+          round(
+            revenue,
+            2
+          ),
+
+        attended,
+
+        attendanceRate:
+          round(
+            attendanceRate,
+            1
+          ),
+
+        averageRating:
+          round(
+            averageRating,
+            1
+          ),
+
+        feedbackCount
+      });
+    } catch (error) {
+      console.error(
+        'Admin analytics error:',
+        error
+      );
+
+      return res.status(500).json({
+        message:
+          'Failed to load admin analytics.'
       });
     }
   }
